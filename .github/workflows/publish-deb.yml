@@ -1,0 +1,77 @@
+name: Build and Publish DEB to Nexus
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+env:
+  PKG_NAME: syspulse
+  PKG_VERSION: 1.0.${{ github.run_number }}
+
+jobs:
+  build-publish-verify:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Go binary and .deb package
+        shell: powershell
+        run: |
+          $script = @"
+          set -e
+          mkdir -p /tmp/pkg/DEBIAN /tmp/pkg/usr/local/bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-X main.Version=${env:PKG_VERSION}" -o /tmp/pkg/usr/local/bin/${env:PKG_NAME} main.go
+          chmod 755 /tmp/pkg/usr/local/bin/${env:PKG_NAME}
+          cat <<EOF > /tmp/pkg/DEBIAN/control
+          Package: ${env:PKG_NAME}
+          Version: ${env:PKG_VERSION}
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Maintainer: Syspulse CI <deployer@example.com>
+          Description: Syspulse CLI system info utility
+          EOF
+          chmod 755 /tmp/pkg/DEBIAN
+          dpkg-deb --build /tmp/pkg /work/${env:PKG_NAME}_${env:PKG_VERSION}_amd64.deb
+          dpkg-deb --info /work/${env:PKG_NAME}_${env:PKG_VERSION}_amd64.deb
+          "@
+          [System.IO.File]::WriteAllText("$PWD\build.sh", ($script -replace "`r`n", "`n"))
+          docker run --rm -v "${{ github.workspace }}:/work" -w /work golang:1.22 bash /work/build.sh
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload .deb to Nexus APT repository
+        shell: powershell
+        env:
+          NEXUS_URL: ${{ secrets.NEXUS_URL }}
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          $baseUrl = $env:NEXUS_URL.TrimEnd('/')
+          $debFile = "${env:PKG_NAME}_${env:PKG_VERSION}_amd64.deb"
+          curl.exe -f -sS -u "$($env:NEXUS_USER):$($env:NEXUS_PASSWORD)" `
+            -H "Content-Type: multipart/form-data" `
+            --data-binary "@$debFile" `
+            "$baseUrl/repository/syspulse/"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Uploaded $debFile to $baseUrl/repository/syspulse/"
+
+      - name: Verify package installation in Ubuntu 22.04
+        shell: powershell
+        env:
+          NEXUS_URL: ${{ secrets.NEXUS_URL }}
+        run: |
+          Start-Sleep -Seconds 5
+          $dockerUrl = $env:NEXUS_URL.TrimEnd('/') -replace 'localhost','host.docker.internal' -replace '127\.0\.0\.1','host.docker.internal'
+          $verifyScript = @"
+          set -e
+          echo "deb [trusted=yes] $dockerUrl/repository/syspulse stable main" > /etc/apt/sources.list.d/syspulse.list
+          apt-get update
+          apt-get install -y ${env:PKG_NAME}
+          ${env:PKG_NAME} --version
+          ${env:PKG_NAME}
+          "@
+          [System.IO.File]::WriteAllText("$PWD\verify.sh", ($verifyScript -replace "`r`n", "`n"))
+          docker run --rm -v "${{ github.workspace }}:/work" -w /work ubuntu:22.04 bash /work/verify.sh
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
