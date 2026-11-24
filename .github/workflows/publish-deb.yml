@@ -1,77 +1,111 @@
-name: Build and Publish DEB to Nexus
+name: Build & Publish syspulse .deb to Nexus (APT)
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [ "main", "release" ]
   workflow_dispatch:
 
 env:
-  PKG_NAME: syspulse
-  PKG_VERSION: 1.0.${{ github.run_number }}
+  APT_DIST: stable
+  APT_COMPONENT: main
 
 jobs:
   build-publish-verify:
     runs-on: self-hosted
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Build Go binary and .deb package
+      - name: Build static Linux binary
         shell: powershell
         run: |
+          Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force dist | Out-Null
+          docker run --rm -v "${{ github.workspace }}:/work" -w /work golang:1.22 bash -c "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/syspulse main.go && ls -lh dist/syspulse"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package as .deb
+        id: pack
+        shell: powershell
+        run: |
+          $pkg = "syspulse"
+          $ver = ([regex]::Match((Get-Content -Raw main.go), 'const\s+Version\s*=\s*"([0-9.]+)"')).Groups[1].Value
+          if (-not $ver) { throw "Version not found in main.go" }
+          Write-Host "Building package $pkg version $ver"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "pkg_ver=$ver"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "deb_path=dist/${pkg}_${ver}_amd64.deb"
+
           $script = @"
           set -e
-          mkdir -p /tmp/pkg/DEBIAN /tmp/pkg/usr/local/bin
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-X main.Version=${env:PKG_VERSION}" -o /tmp/pkg/usr/local/bin/${env:PKG_NAME} main.go
-          chmod 755 /tmp/pkg/usr/local/bin/${env:PKG_NAME}
-          cat <<EOF > /tmp/pkg/DEBIAN/control
-          Package: ${env:PKG_NAME}
-          Version: ${env:PKG_VERSION}
+          rm -rf "/tmp/build/${pkg}_${ver}"
+          mkdir -p "/tmp/build/${pkg}_${ver}/DEBIAN" "/tmp/build/${pkg}_${ver}/usr/bin"
+          cp "/work/dist/${pkg}" "/tmp/build/${pkg}_${ver}/usr/bin/${pkg}"
+          chmod 755 "/tmp/build/${pkg}_${ver}/usr/bin/${pkg}"
+          cat <<EOF > "/tmp/build/${pkg}_${ver}/DEBIAN/control"
+          Package: ${pkg}
+          Version: ${ver}
           Section: utils
           Priority: optional
           Architecture: amd64
-          Maintainer: Syspulse CI <deployer@example.com>
-          Description: Syspulse CLI system info utility
+          Maintainer: DevOps Team <devops@example.com>
+          Description: Lightweight CLI tool for a system health snapshot
+           Reads /proc and reports uptime, load average and memory info.
+          Depends: libc6 (>= 2.17)
           EOF
-          chmod 755 /tmp/pkg/DEBIAN
-          dpkg-deb --build /tmp/pkg /work/${env:PKG_NAME}_${env:PKG_VERSION}_amd64.deb
-          dpkg-deb --info /work/${env:PKG_NAME}_${env:PKG_VERSION}_amd64.deb
+          chmod 755 "/tmp/build/${pkg}_${ver}/DEBIAN"
+          dpkg-deb --build --root-owner-group "/tmp/build/${pkg}_${ver}" "/work/dist/${pkg}_${ver}_amd64.deb"
+          echo "--- dpkg-deb --info ---"
+          dpkg-deb --info "/work/dist/${pkg}_${ver}_amd64.deb"
+          echo "--- dpkg-deb --contents ---"
+          dpkg-deb --contents "/work/dist/${pkg}_${ver}_amd64.deb"
           "@
-          [System.IO.File]::WriteAllText("$PWD\build.sh", ($script -replace "`r`n", "`n"))
-          docker run --rm -v "${{ github.workspace }}:/work" -w /work golang:1.22 bash /work/build.sh
+          [System.IO.File]::WriteAllText("$PWD\package.sh", ($script -replace "`r`n", "`n"))
+          docker run --rm -v "${{ github.workspace }}:/work" -w /work golang:1.22 bash /work/package.sh
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Upload .deb to Nexus APT repository
+      - name: Upload .deb to Nexus (APT deploy)
         shell: powershell
         env:
-          NEXUS_URL: ${{ secrets.NEXUS_URL }}
+          NEXUS_HOST: ${{ secrets.NEXUS_HOST }}
           NEXUS_USER: ${{ secrets.NEXUS_USER }}
           NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
         run: |
-          $baseUrl = $env:NEXUS_URL.TrimEnd('/')
-          $debFile = "${env:PKG_NAME}_${env:PKG_VERSION}_amd64.deb"
+          $debPath = "${{ steps.pack.outputs.deb_path }}"
+          $url = "http://$($env:NEXUS_HOST):8081/repository/syspulse/"
           curl.exe -f -sS -u "$($env:NEXUS_USER):$($env:NEXUS_PASSWORD)" `
             -H "Content-Type: multipart/form-data" `
-            --data-binary "@$debFile" `
-            "$baseUrl/repository/syspulse/"
+            --data-binary "@$debPath" `
+            "$url"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Write-Host "Uploaded $debFile to $baseUrl/repository/syspulse/"
+          Write-Host "Package $debPath deployed to Nexus APT repository 'syspulse'."
 
-      - name: Verify package installation in Ubuntu 22.04
+      - name: Verify install via apt in Ubuntu container
         shell: powershell
         env:
-          NEXUS_URL: ${{ secrets.NEXUS_URL }}
+          NEXUS_HOST: ${{ secrets.NEXUS_HOST }}
         run: |
           Start-Sleep -Seconds 5
-          $dockerUrl = $env:NEXUS_URL.TrimEnd('/') -replace 'localhost','host.docker.internal' -replace '127\.0\.0\.1','host.docker.internal'
+          $dockerHost = $env:NEXUS_HOST -replace '^(localhost|127\.0\.0\.1)$','host.docker.internal'
           $verifyScript = @"
           set -e
-          echo "deb [trusted=yes] $dockerUrl/repository/syspulse stable main" > /etc/apt/sources.list.d/syspulse.list
+          echo "deb [trusted=yes] http://${dockerHost}:8081/repository/syspulse/ ${{ env.APT_DIST }} ${{ env.APT_COMPONENT }}" > /etc/apt/sources.list.d/syspulse.list
           apt-get update
-          apt-get install -y ${env:PKG_NAME}
-          ${env:PKG_NAME} --version
-          ${env:PKG_NAME}
+          apt-get install -y syspulse
+          echo "--- package info ---"
+          dpkg -s syspulse | grep -E "^(Package|Version|Architecture)"
+          echo "--- run app ---"
+          syspulse --version
+          syspulse
+          echo "Verification passed: syspulse installed from Nexus and runs correctly."
           "@
           [System.IO.File]::WriteAllText("$PWD\verify.sh", ($verifyScript -replace "`r`n", "`n"))
           docker run --rm -v "${{ github.workspace }}:/work" -w /work ubuntu:22.04 bash /work/verify.sh
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Save .deb as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: syspulse-deb
+          path: dist/*.deb
+          retention-days: 7
