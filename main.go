@@ -1,32 +1,34 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"os"
 	"runtime"
-	"time"
+	"strings"
 )
 
-var Version = "dev"
+const Version = "1.2.0"
+
+func procTrim(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "n/a"
+	}
+	return strings.TrimSpace(string(b))
+}
 
 func main() {
-	showVersion := flag.Bool("version", false, "print version and exit")
-	flag.Parse()
-
-	if *showVersion {
-		fmt.Printf("syspulse %s\n", Version)
+	if len(os.Args) > 1 && os.Args[1] == "--version" {
+		fmt.Println("syspulse", Version)
 		return
 	}
 
-	hostname, err := os.Hostname()
-	if err != nil {
-		hostname = "unknown"
-	}
-
-	fmt.Printf("Syspulse v%s\n", Version)
-	fmt.Printf("Host: %s\n", hostname)
-	fmt.Printf("OS/Arch: %s/%s\n", runtime.GOOS, runtime.GOARCH)
-	fmt.Printf("CPUs: %d\n", runtime.NumCPU())
-	fmt.Printf("Time: %s\n", time.Now().Format(time.RFC3339))
+	fmt.Println("=== SysPulse ===")
+	fmt.Println("version:   ", Version)
+	fmt.Println("go:        ", runtime.Version())
+	fmt.Println("cpus:      ", runtime.NumCPU())
+	fmt.Println("goroutines:", runtime.NumGoroutine())
+	fmt.Println("uptime:    ", procTrim("/proc/uptime"))
+	fmt.Println("loadavg:   ", procTrim("/proc/loadavg"))
+	fmt.Println("meminfo:   ", strings.Split(procTrim("/proc/meminfo"), "\n")[0])
 }
